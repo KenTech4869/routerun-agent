@@ -200,6 +200,31 @@ Week 3 到達時に以下の出力が表示される：
 python -m evals.run_eval --ab --output results/ab_summary.json
 ```
 
+### 5. デモデータ削除（クリーンアップ）
+
+```bash
+python -m demo.seed_demo_data --cleanup
+```
+
+`isDemo: true` フラグ付きドキュメント（`run_history`, `agent_planning_queue`, `trainingPlan`, `goalContext`）を全削除する。
+
+---
+
+## デモビデオ収録チェックリスト
+
+| # | 画面 | 確認内容 |
+|---|------|---------|
+| 1 | iOS シミュレータ | ランニング完了 → `onRunCompleted` CF が `agent_planning_queue` に enqueue |
+| 2 | ターミナル | `run_timeline` 実行 → Week 3 `★ PERTURBATION ★` 表示・`readinessAdjustment: reduce` |
+| 3 | Firestore Console | `users/test_sub4.trainingPlan` の `evaluatorPassed: true` |
+| 4 | Vertex AI Console | Trace Viewer で Head Coach → Periodization → Readiness → Evaluator 呼び出しグラフ |
+| 5 | ターミナル | `ab_summary.json` の SDT 94% pass rate |
+
+Vertex AI Trace Viewer URL:
+```
+https://console.cloud.google.com/vertex-ai/agents?project=runroute-476505
+```
+
 ---
 
 ## 実装ポイント（技術的判断記録）
