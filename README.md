@@ -11,8 +11,10 @@ RouteRun の「あゆむ」AI コーチを、Vertex AI Agent Engine 上の **Sup
 | 項目 | 値 |
 |------|----|
 | Agent Engine | `projects/231451951695/locations/asia-northeast1/reasoningEngines/3999011751151534080` |
-| Head Coach モデル | `gemini-2.5-pro` |
-| Sub-agents モデル | `gemini-2.5-flash` (Readiness: thinking_budget=1024) |
+| Head Coach モデル | `gemini-2.5-pro` (thinking_budget=2048) |
+| Periodization モデル | `gemini-2.5-pro` (thinking_budget=4096) |
+| Readiness モデル | `gemini-2.5-flash` (thinking_budget=1024) |
+| Evaluator モデル | `gemini-2.5-flash-lite` (thinking 不要、パターンマッチ特化) |
 | パターン | B (Supervisor マルチエージェント) + D (In-loop Evaluator) |
 | Eval rubrics | SDT Alignment / Honest Data / ACWR Safety |
 | SDT pass rate | 94% (gemini-2.5-pro / gemini-2.5-flash 同等) |
@@ -50,12 +52,12 @@ Vertex AI Agent Engine  ←─────────────────�
 
 ### エージェント役割分担
 
-| Agent | モデル | 役割 |
-|-------|--------|------|
-| **Head Coach** (`ayumu_head_coach`) | gemini-2.5-pro | 全体ループ制御・計画統合・最終出力 |
-| **Periodization** | gemini-2.5-pro | レース目標に向けたメソ/マイクロサイクル構築 |
-| **Readiness** | gemini-2.5-flash + thinking=medium | HRV / 睡眠 / 安静時 HR から負荷調整判定 |
-| **Evaluator** | gemini-2.5-flash | SDT / Honest-Data / ACWR 品質ゲート |
+| Agent | モデル | Thinking Budget | 役割 |
+|-------|--------|----------------|------|
+| **Head Coach** (`ayumu_head_coach`) | gemini-2.5-pro | 2048 | 全体ループ制御・計画統合・最終出力 |
+| **Periodization** | gemini-2.5-pro | 4096 | レース目標に向けたメソ/マイクロサイクル構築 |
+| **Readiness** | gemini-2.5-flash | 1024 | HRV / 睡眠 / 安静時 HR から負荷調整判定 |
+| **Evaluator** | gemini-2.5-flash-lite | 0 | SDT / Honest-Data / ACWR パターンマッチゲート |
 
 ---
 
