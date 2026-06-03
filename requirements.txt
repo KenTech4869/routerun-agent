@@ -1,0 +1,7 @@
+# google-cloud-aiplatform[adk] が google-adk==1.34.3 を引く（2.x は現時点で競合）
+# install order: aiplatform[agent_engines,adk] → firebase-admin → requests → python-dotenv
+google-cloud-aiplatform[agent_engines,adk]>=1.112
+firebase-admin>=6.5.0
+google-cloud-firestore>=2.19.0
+requests>=2.32.0
+python-dotenv>=1.0.0

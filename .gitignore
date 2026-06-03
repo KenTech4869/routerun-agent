@@ -1,0 +1,26 @@
+# 鍵・秘密情報 (コミット禁止)
+*.json
+!pyproject.toml
+.env
+*.pem
+*.p12
+*service-account*.json
+*credentials*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# 実行ログ・一時ファイル
+logs/
+results/
+*.log
+
+# OS
+.DS_Store
