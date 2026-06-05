@@ -1,0 +1,110 @@
+{
+  "description": "Anonymised Firestore goalContext snapshots written by write_training_plan (2026-06-04). Real UIDs replaced with anonymous tokens.",
+  "schema_version": 2,
+  "samples": [
+    {
+      "uid": "usr_anon_a1b2",
+      "writtenAt": "2026-06-04T01:12:39Z",
+      "trigger": "onRunCompleted",
+      "runInput": {
+        "distanceKm": 10.2,
+        "durationMin": 59.4,
+        "avgPaceMinPerKm": 5.82,
+        "avgHeartRate": 162
+      },
+      "goalContext": {
+        "currentFitness": {
+          "acwr": 1.47,
+          "trainingPhase": "build",
+          "weeklyVolumeTrend": "increasing",
+          "readinessAdjustment": "reduce",
+          "readinessReason": "ACWR exceeded 1.4 — acute load spike detected over 7-day window. Recommend 20% volume reduction to prevent overuse injury.",
+          "agentUpdatedAt": 1749002359,
+          "targetPaceToday": 348,
+          "weeklyDistanceKm": 38.4,
+          "weeklyTargetKm": 32.0
+        },
+        "todayWorkout": {
+          "type": "easy",
+          "targetDistanceKm": 6.0,
+          "targetPaceSecPerKm": 360,
+          "description": "Easy recovery run — keep HR below 145 bpm"
+        },
+        "raceTarget": null,
+        "version": 2
+      },
+      "agentRationale": "7-day acute load 38.4 km vs 28-day chronic average 26.1 km → ACWR 1.47. Injury risk zone. Head Coach overrides rule-based ACWR with full reasoning and drops weekly target by 17%."
+    },
+    {
+      "uid": "usr_anon_i9j0",
+      "writtenAt": "2026-06-04T03:44:51Z",
+      "trigger": "onRunCompleted",
+      "runInput": {
+        "distanceKm": 5.1,
+        "durationMin": 32.7,
+        "avgPaceMinPerKm": 6.41,
+        "avgHeartRate": 148
+      },
+      "goalContext": {
+        "currentFitness": {
+          "acwr": 0.98,
+          "trainingPhase": "base",
+          "weeklyVolumeTrend": "stable",
+          "readinessAdjustment": "maintain",
+          "readinessReason": null,
+          "agentUpdatedAt": 1749019491,
+          "targetPaceToday": 384,
+          "weeklyDistanceKm": 17.2,
+          "weeklyTargetKm": 20.0
+        },
+        "todayWorkout": {
+          "type": "base",
+          "targetDistanceKm": 5.0,
+          "targetPaceSecPerKm": 390,
+          "description": "Base aerobic run at conversational pace"
+        },
+        "raceTarget": null,
+        "version": 2
+      },
+      "agentRationale": "Free user — write_training_plan writes readinessAdjustment and basic workout context only. Personalised plan fields (readinessReason, detailed raceTarget) omitted per Pro gate."
+    },
+    {
+      "uid": "usr_anon_q7r8",
+      "writtenAt": "2026-06-04T08:08:42Z",
+      "trigger": "onRunCompleted",
+      "runInput": {
+        "distanceKm": 14.8,
+        "durationMin": 77.6,
+        "avgPaceMinPerKm": 5.24,
+        "avgHeartRate": 158
+      },
+      "goalContext": {
+        "currentFitness": {
+          "acwr": 0.71,
+          "trainingPhase": "peak",
+          "weeklyVolumeTrend": "decreasing",
+          "readinessAdjustment": "intensify",
+          "readinessReason": "ACWR below 0.8 — chronic load capacity under-utilised. Athlete is in peak phase with race in 18 days. Safe window to add 5-8% volume.",
+          "agentUpdatedAt": 1749038922,
+          "targetPaceToday": 315,
+          "weeklyDistanceKm": 51.3,
+          "weeklyTargetKm": 58.0
+        },
+        "todayWorkout": {
+          "type": "tempo",
+          "targetDistanceKm": 10.0,
+          "targetPaceSecPerKm": 318,
+          "description": "Tempo run — 3km warm-up, 6km at half-marathon pace, 1km cool-down"
+        },
+        "raceTarget": {
+          "eventId": "evt_anon_osaka_hm",
+          "distanceKm": 21.0975,
+          "targetTimeSeconds": 6480,
+          "daysUntilRace": 18
+        },
+        "version": 2
+      },
+      "agentRationale": "Peak phase, 18 days to race. ACWR 0.71 indicates underloading. Head Coach safely prescribes +13% weekly volume and race-pace tempo session to sharpen fitness before taper."
+    }
+  ]
+}
