@@ -45,8 +45,8 @@ DEMO_USERS = [
         "locale": "ja",
         "goal": "fullMarathon",
         "level": "intermediate",
-        "target_pace_min_per_km": 5.40,   # 3:48/km でサブ4 → 現在は 5.40 min/km
-        "weekly_distance_km": 35.0,
+        "target_pace_min_per_km": 5.67,   # 5:40/km × 42.195km = 3:59:50 → サブ4レースペース
+        "weekly_distance_km": 52.0,        # intermediate サブ4: 50〜65km/週が標準
         "vo2max": 48.0,
         "race_name": "東京マラソン 2027",
         "race_distance_km": 42.195,
@@ -149,12 +149,13 @@ def _build_run_history(user: dict) -> list[dict[str, Any]]:
                 (6, weekly_km * 0.40, base_pace + 0.8, 135.0, week == 3),  # Sat: Long (skip on week3)
             ]
         else:
-            # 週3-4回: Easy + Tempo + ロング走
+            # 週3-4回: Easy (zone2) + Tempo (LT) + ロング走
+            # base_pace = レースペース(5:40/km)。イージーは +0.8 = 6:28/km でゾーン2に収まる
             sessions = [
-                (1, weekly_km * 0.25, base_pace + 0.4, 143.0, False),  # Mon: Easy
-                (3, weekly_km * 0.20, base_pace - 0.3, 158.0, False),  # Wed: Tempo
-                (5, weekly_km * 0.20, base_pace + 0.4, 140.0, False),  # Fri: Easy
-                (6, weekly_km * 0.35, base_pace + 0.7, 136.0, False),  # Sat: Long
+                (1, weekly_km * 0.25, base_pace + 0.8, 138.0, False),  # Mon: Easy zone2
+                (3, weekly_km * 0.20, base_pace - 0.3, 158.0, False),  # Wed: Tempo LT
+                (5, weekly_km * 0.20, base_pace + 0.8, 135.0, False),  # Fri: Easy zone2
+                (6, weekly_km * 0.35, base_pace + 0.7, 136.0, False),  # Sat: Long easy-mod
             ]
 
         for day_offset, dist, pace, hr, skip in sessions:
@@ -175,9 +176,15 @@ def _build_run_history(user: dict) -> list[dict[str, Any]]:
 
 
 def _build_goal_context(user: dict) -> dict[str, Any]:
-    """users/{uid}.goalContext を生成。"""
+    """users/{uid}.goalContext を生成。
+
+    デモシナリオ: Week3 perturbation 直後の状態（ACWR=1.25 の疲労蓄積ピーク）から
+    Week4 の計画を立てる場面。エージェントが ACWR 高値を検知して安全な負荷調整を
+    提案する動きを見せるため、Week8 最終値ではなく Week3 直後の値を使う。
+    """
+    weekly_km = user["weekly_distance_km"]
     return {
-        "acwr": 1.05,  # Week8 終了時点
+        "acwr": 1.25,  # Week3 perturbation 直後 — エージェントに ACWR 警戒を見せる
         "trainingPhase": "base_building",
         "weeklyVolumeTrend": "increasing",
         "todayWorkout": None,
@@ -190,7 +197,13 @@ def _build_goal_context(user: dict) -> dict[str, Any]:
         "currentFitness": {
             "vo2MaxEstimate": user["vo2max"],
             "recentPaceMinPerKm": user["target_pace_min_per_km"],
-            "monthlyDistanceKm": user["weekly_distance_km"] * 4,
+            "monthlyDistanceKm": weekly_km * 4,
+            # write_training_plan の _check_acwr_safety が読む 2 フィールド
+            # weeklyDistanceKm: Week3 の reduced 値ではなく通常ベース値を使う
+            #   → +10% cap = sub4: 38.5km / firstfull: 27.5km（適切な計画が通る）
+            # ACWR=1.25: code safety は 1.3 超で block → LLM 推論で警告を出しつつ計画が通る
+            "weeklyDistanceKm": weekly_km,
+            "acwr": 1.25,
         },
         "locale": user["locale"],
         "isDemo": True,

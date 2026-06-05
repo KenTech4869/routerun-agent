@@ -154,6 +154,44 @@ athlete_state の acwr と weeklyDistanceKm を読み取る。
 - PASS/FAIL 以外の判定は返さない。
 - violations の各エントリは Head Coach が即座に修正できるよう「どの単語/数値が問題か」を明示する。
 - athlete_state や weeklyDistanceKm が未提供の場合、Step 3 はスキップして PASS 扱いにする。
+
+# Few-Shot Examples（JA / EN 両方を参照すること）
+
+## [JA] Example 1 — PASS（違反なし）
+Input athlete_state: {"acwr": 0.95, "weeklyDistanceKm": 30}
+Input response: "今週は32kmを目標に、ゾーン2のイージーラン4回で構成します。"
+Step 1: 禁止ワードなし / Step 2: 外部統計なし / Step 3: +6.7% ≤ 10%, acwr=0.95 ≤ 1.3
+Output: {"result": "PASS"}
+
+## [JA] Example 2 — FAIL（SDT 違反）
+Input athlete_state: {"acwr": 1.0, "weeklyDistanceKm": 25}
+Input response: "ペースが遅すぎます。インターバルで改善しましょう。"
+Step 1: "遅すぎ" 検出 → SDT_FAIL
+Output: {"result": "FAIL", "violations": ["Step 1: '遅すぎ' を検出。ペースはゾーン表記に置き換えること"]}
+
+## [JA] Example 3 — FAIL（ACWR 超過）
+Input athlete_state: {"acwr": 1.35, "weeklyDistanceKm": 40}
+Input response: '{"weeklyTargetKm": 48}'
+Step 3: increase_rate=0.20 > 0.10, acwr=1.35 > 1.3 → ACWR_FAIL
+Output: {"result": "FAIL", "violations": ["Step 3: weeklyTargetKm=48km は+20%増 (上限+10%超過)。ACWR=1.35>1.3 時は負荷増加禁止"]}
+
+## [EN] Example 4 — PASS (no violations)
+Input athlete_state: {"acwr": 1.05, "weeklyDistanceKm": 40}
+Input response: "This week targets 42 km. Wednesday: tempo (zone 3). Sunday: long run (zone 2)."
+Step 1: No negative pace words / Step 2: No fabricated stats / Step 3: +5% ≤ 10%, acwr=1.05 ≤ 1.3
+Output: {"result": "PASS"}
+
+## [EN] Example 5 — FAIL (Honest-Data violation)
+Input athlete_state: {"acwr": 0.95, "weeklyDistanceKm": 28}
+Input response: "Your estimated VO2max is 52.3 ml/kg/min."
+Step 2: VO2max=52.3 absent from athlete_state → HONEST_FAIL
+Output: {"result": "FAIL", "violations": ["Step 2: VO2max=52.3 not in athlete_state. Remove fabricated values."]}
+
+## [EN] Example 6 — FAIL (SDT + ACWR double violation)
+Input athlete_state: {"acwr": 1.4, "weeklyDistanceKm": 35}
+Input response: '{"weeklyTargetKm": 42, "notes": "Your pace is too slow."}'
+Step 1: "too slow" → SDT_FAIL / Step 3: +20%, acwr=1.4 > 1.3 → ACWR_FAIL
+Output: {"result": "FAIL", "violations": ["Step 1: 'too slow' detected. Use zone notation.", "Step 3: +20% exceeds +10% limit. ACWR=1.4>1.3 prohibits load increase."]}
 """
 
 
@@ -204,6 +242,15 @@ def deploy() -> str:
         return r.json()["result"]
 
     # ── ADK tools (local functions → pickled by value) ───────────────────────
+
+    def _is_pro_user(uid: str) -> bool:
+        """Pro ステータスを Firestore で確認する認可ミドルウェア。"""
+        try:
+            user_doc = _db().collection("users").document(uid).get()
+            subscription_status = (user_doc.to_dict() or {}).get("subscriptionStatus", "")
+            return subscription_status in ("pro", "trial")
+        except Exception:
+            return False  # 安全側: Pro 未確認はゲート維持
 
     def get_athlete_state(uid: str) -> dict:
         """走者の現在の fitness state を返す。計画サイクルの最初に必ず呼ぶ。
@@ -288,22 +335,99 @@ def deploy() -> str:
             uid_token,
         )
 
-    def write_training_plan(uid: str, plan: dict) -> bool:
+    def write_training_plan(uid: str, plan: dict) -> dict:
         """評価済み計画を users/{uid}.trainingPlan に永続化 (Memory Bank)。
 
-        isDemo=true が付いていない計画は拒否する（安全ガード）。
+        Pro 会員・isDemo=true・test_ UID のいずれかが必要（安全ガード）。
+        P0-1 OpenAI UX Fix: readinessAdjustment + readinessReason を goalContext に反映。
+        P1-SDT Fix: SDT 禁止ワードをルールベースで二重ガード（LLM 非依存）。
+        P2-DeepMind Fix: planVersion による冪等性チェック。
+        Build 71: 全 Pro ユーザー対応（DEMO_UIDS 廃止・_is_pro_user() チェック追加）。
         """
-        if not plan.get("isDemo", False) and not uid.startswith("test_"):
+        import time as _t
+        import json as _json
+
+        # P1-SDT: SDT 禁止ワードをルールベースでチェック（LLM に依存しない二重ガード）
+        SDT_FORBIDDEN = ["slow", "遅い", "遅く", "遅すぎ", "too slow"]
+        plan_text = _json.dumps(plan, ensure_ascii=False).lower()
+        sdt_hits = [w for w in SDT_FORBIDDEN if w in plan_text]
+        if sdt_hits:
             raise ValueError(
-                "write_training_plan: 本番ユーザーへの書き込みはデモ期間中禁止。"
-                "uid を test_ プレフィックスにするか isDemo=true を付けること。"
+                f"[SDT Safety] 計画拒否: 禁止ワード {sdt_hits} を検出。"
+                f"ペースはゾーン表記（zone1-zone5/race）に置き換えること。"
             )
+
+        # Build 71: Pro 会員・isDemo=true・test_ UID のいずれかを許可
+        is_pro = _is_pro_user(uid)
+        if not plan.get("isDemo", False) and not uid.startswith("test_") and not is_pro:
+            raise ValueError(
+                "write_training_plan: Pro 会員・isDemo=true・test_ UID のいずれかが必要です。"
+            )
+
         db = _db()
+
+        # P2-DeepMind: 冪等性チェック
+        incoming_version = plan.get("planVersion") or plan.get("plan_version")
+        if incoming_version is not None:
+            try:
+                existing = (db.collection("users").document(uid).get().to_dict() or {})
+                existing_version = existing.get("trainingPlan", {}).get("planVersion")
+                if existing_version is not None and existing_version == incoming_version:
+                    return {"success": True, "plan_version": incoming_version, "readiness_updated": False, "skipped": True}
+            except Exception:
+                pass
+
+        # ACWR ルールベース安全チェック
+        try:
+            user_doc = db.collection("users").document(uid).get()
+            goal_context = (user_doc.to_dict() or {}).get("goalContext", {})
+            fitness = goal_context.get("currentFitness", {})
+            current_km = fitness.get("weeklyDistanceKm", 0) or 0
+            acwr = fitness.get("acwr", 0.0) or 0.0
+            target_km = None
+            if isinstance(plan.get("cycle"), dict):
+                target_km = plan["cycle"].get("weeklyTargetKm")
+            if target_km is None:
+                target_km = plan.get("weeklyTargetKm")
+            if isinstance(current_km, (int, float)) and current_km > 0 and isinstance(target_km, (int, float)) and target_km > 0:
+                increase_rate = (target_km - current_km) / current_km
+                violations = []
+                if increase_rate > 0.10:
+                    violations.append(f"週間目標 +{increase_rate * 100:.1f}% 超過 ({current_km}→{target_km}km, 上限+10%)")
+                if acwr > 1.3 and target_km > current_km:
+                    violations.append(f"ACWR={acwr:.2f}>1.3 時の負荷増加禁止 ({current_km}→{target_km}km)")
+                if violations:
+                    raise ValueError(f"[ACWR Safety] 計画拒否: {' / '.join(violations)}")
+        except ValueError:
+            raise
+        except Exception:
+            pass
+
+        saved_version = incoming_version or int(_t.time())
         db.collection("users").document(uid).set(
-            {"trainingPlan": plan},
+            {"trainingPlan": {**plan, "savedAt": int(_t.time()), "planVersion": saved_version}},
             merge=True,
         )
-        return True
+
+        # P0-1 OpenAI UX Fix: readinessAdjustment + readinessReason を goalContext に反映
+        readiness_updated = False
+        agent_adjustment = plan.get("readinessAdjustment")
+        agent_reason = plan.get("readinessReason") or plan.get("message")
+        if agent_adjustment in ("maintain", "reduce", "intensify"):
+            try:
+                db.collection("users").document(uid).set(
+                    {"goalContext": {"currentFitness": {
+                        "readinessAdjustment": agent_adjustment,
+                        "readinessReason": agent_reason,
+                        "agentUpdatedAt": int(_t.time()),
+                    }}},
+                    merge=True,
+                )
+                readiness_updated = True
+            except Exception:
+                pass
+
+        return {"success": True, "plan_version": saved_version, "readiness_updated": readiness_updated, "skipped": False}
 
     # ── Agent definitions ────────────────────────────────────────────────────
     from google.adk.agents import Agent
@@ -390,8 +514,42 @@ def deploy() -> str:
     resource_name = remote_agent.resource_name
     print(f"\n✅ Deployed successfully!")
     print(f"   resource_name: {resource_name}")
-    print(f"\n   Add to .env:")
-    print(f"   AGENT_ENGINE_RESOURCE_NAME={resource_name}")
+
+    # P0-1 GCP Fix: resource_name を Secret Manager に自動保存
+    # CI/CD 環境で resource_name を確実に引き継げるようにする。
+    # SECRET_NAME 環境変数でシークレット名を上書き可能。
+    secret_name = os.getenv("AGENT_ENGINE_SECRET_NAME", "AGENT_ENGINE_RESOURCE_NAME")
+    try:
+        import subprocess
+        result = subprocess.run(
+            [
+                "gcloud", "secrets", "versions", "add", secret_name,
+                f"--project={PROJECT}",
+                "--data-stdin",
+            ],
+            input=resource_name.encode(),
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            print(f"   ✅ Saved to Secret Manager: projects/{PROJECT}/secrets/{secret_name}")
+        else:
+            # シークレットが存在しない場合は作成してから再試行
+            subprocess.run(
+                ["gcloud", "secrets", "create", secret_name, f"--project={PROJECT}", "--replication-policy=automatic"],
+                capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ["gcloud", "secrets", "versions", "add", secret_name, f"--project={PROJECT}", "--data-stdin"],
+                input=resource_name.encode(), capture_output=True, timeout=30,
+            )
+            print(f"   ✅ Created and saved to Secret Manager: projects/{PROJECT}/secrets/{secret_name}")
+    except Exception as e:
+        # Secret Manager への保存失敗はデプロイを妨げない
+        print(f"   ⚠️  Secret Manager save failed (manual .env update required): {e}")
+        print(f"\n   Add to .env manually:")
+        print(f"   AGENT_ENGINE_RESOURCE_NAME={resource_name}")
+
     print(f"\n   Trace viewer:")
     print(f"   https://console.cloud.google.com/vertex-ai/agents?project={PROJECT}")
 

@@ -30,6 +30,13 @@ from .rubrics import ALL_RUBRICS, ACWR_SAFETY, HONEST_DATA, SDT_ALIGNMENT
 # athlete_state × response のペア。
 # 各サンプルには known_violations (list) を付与して ground truth を記録。
 
+# P1-1 FIX: 分布バイアス修正
+# 全50サンプル (60%が意図的違反) の pass_rate は「低pass_rate=高検出感度」と誤解されやすい。
+# 真の精度指標は「クリーンサンプルのみの pass_rate」(precision) と
+# 「違反サンプルの検出率」(recall) を分離して計測すること。
+# CLEAN_EVAL_DATASET: 違反なしサンプルのみ (precision 評価用)
+CLEAN_EVAL_DATASET: list[dict] = []  # run_eval() 後に EVAL_DATASET から抽出して使用
+
 EVAL_DATASET = [
     # ─ SDT-alignment violations (10件) ─
     {
@@ -120,6 +127,14 @@ EVAL_DATASET = [
 ]
 
 
+def _extract_scores(eval_result: Any, metric_name: str) -> list[float]:
+    """評価結果からスコアリストを抽出するヘルパー。"""
+    score_col = f"{metric_name}/score"
+    if score_col in eval_result.metrics_table.columns:
+        return eval_result.metrics_table[score_col].dropna().tolist()
+    return eval_result.metrics_table.select_dtypes("number").iloc[:, 0].dropna().tolist()
+
+
 def run_eval(
     model_id: str,
     output_path: str,
@@ -127,18 +142,26 @@ def run_eval(
     location: str,
     sample_limit: int = 50,
 ) -> dict[str, Any]:
-    """指定モデルで全 rubric を評価し、スコアと違反サンプルを返す。"""
+    """指定モデルで全 rubric を評価し、スコアと違反サンプルを返す。
+
+    P1-1 FIX: 全体 pass_rate に加え、クリーンサンプルのみの precision と
+    違反サンプルの recall を分離計測し、分布バイアスを排除する。
+    """
     # Gen AI Evaluation Service は us-central1 のみ対応 (asia-northeast1 不可)
     eval_location = "us-central1"
     vertexai.init(project=project, location=eval_location)
 
     dataset = EVAL_DATASET[:sample_limit]
-    print(f"\n[eval] model={model_id}, samples={len(dataset)}")
+    clean_dataset = [s for s in dataset if not s.get("known_violations")]
+    violation_dataset = [s for s in dataset if s.get("known_violations")]
+    print(f"\n[eval] model={model_id}, total={len(dataset)}, clean={len(clean_dataset)}, violations={len(violation_dataset)}")
 
     results: dict[str, Any] = {
         "model": model_id,
         "evaluated_at": datetime.utcnow().isoformat() + "Z",
         "samples": len(dataset),
+        "clean_samples": len(clean_dataset),
+        "violation_samples": len(violation_dataset),
         "rubrics": {},
     }
 
@@ -148,41 +171,115 @@ def run_eval(
         t0 = time.time()
 
         try:
-            df = pd.DataFrame(dataset)
-            task = EvalTask(dataset=df, metrics=[metric])
-            # model= を省略すると dataset の "response" 列をそのまま評価
-            eval_result = task.evaluate()
+            # ── 全体評価 ──
+            df_all = pd.DataFrame(dataset)
+            task_all = EvalTask(dataset=df_all, metrics=[metric])
+            result_all = task_all.evaluate()
+            scores_all = _extract_scores(result_all, metric_name)
+            mean_all = sum(scores_all) / len(scores_all) if scores_all else 0.0
+            fail_all = sum(1 for s in scores_all if s < 0)
+
+            # ── P1-1 FIX: クリーンサンプルのみの精度 (precision) ──
+            # 低い pass_rate = 違反を正しく弾いている ではなく、
+            # クリーンサンプルの pass_rate こそが誤検知率の逆数
+            precision_pass_rate: float | None = None
+            if clean_dataset:
+                df_clean = pd.DataFrame(clean_dataset)
+                task_clean = EvalTask(dataset=df_clean, metrics=[metric])
+                result_clean = task_clean.evaluate()
+                scores_clean = _extract_scores(result_clean, metric_name)
+                if scores_clean:
+                    fail_clean = sum(1 for s in scores_clean if s < 0)
+                    precision_pass_rate = round((len(scores_clean) - fail_clean) / len(scores_clean), 3)
+
+            # ── P1-1 FIX: 違反サンプルの検出率 (recall) ──
+            recall_detect_rate: float | None = None
+            if violation_dataset:
+                df_viol = pd.DataFrame(violation_dataset)
+                task_viol = EvalTask(dataset=df_viol, metrics=[metric])
+                result_viol = task_viol.evaluate()
+                scores_viol = _extract_scores(result_viol, metric_name)
+                if scores_viol:
+                    # 違反が正しく FAIL (score < 0) になっている割合 = recall
+                    detected = sum(1 for s in scores_viol if s < 0)
+                    recall_detect_rate = round(detected / len(scores_viol), 3)
+
             elapsed = time.time() - t0
-
-            score_col = f"{metric_name}/score"
-            if score_col in eval_result.metrics_table.columns:
-                scores = eval_result.metrics_table[score_col].dropna().tolist()
-            else:
-                scores = eval_result.metrics_table.select_dtypes("number").iloc[:, 0].dropna().tolist()
-            mean_score = sum(scores) / len(scores) if scores else 0.0
-            fail_count = sum(1 for s in scores if s < 0)
-
             results["rubrics"][metric_name] = {
-                "mean_score": round(mean_score, 3),
-                "pass_rate": round((len(scores) - fail_count) / len(scores), 3),
-                "fail_count": fail_count,
+                "overall_mean_score": round(mean_all, 3),
+                "overall_pass_rate": round((len(scores_all) - fail_all) / len(scores_all), 3) if scores_all else 0.0,
+                # P1-1: 分離指標（これが本質的な精度・再現率）
+                "precision_clean_only_pass_rate": precision_pass_rate,
+                "recall_violation_detect_rate": recall_detect_rate,
+                "fail_count_total": fail_all,
                 "elapsed_sec": round(elapsed, 1),
             }
-            print(f" mean={mean_score:.3f}, fails={fail_count} ({elapsed:.1f}s)")
+            print(
+                f" mean={mean_all:.3f}, precision={precision_pass_rate}, recall={recall_detect_rate} ({elapsed:.1f}s)"
+            )
 
         except Exception as e:
             results["rubrics"][metric_name] = {"error": str(e)}
             print(f" ERROR: {e}")
 
-    # ── 既知違反の検出率 (recall) ────────────────────────────────────────
-    known_violations = [s for s in dataset if s.get("known_violations")]
-    results["known_violation_samples"] = len(known_violations)
-
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"\n[eval] report saved → {output_path}")
+    print("\n[eval] 解釈ガイド:")
+    print("  precision_clean_only_pass_rate: クリーン計画を正しくPASSする割合 (1.0が理想)")
+    print("  recall_violation_detect_rate:   違反計画を正しく検出する割合 (1.0が理想)")
 
+    return results
+
+
+def run_clean_eval(
+    model_id: str,
+    output_path: str,
+    project: str,
+    location: str,
+) -> dict[str, Any]:
+    """クリーンサンプルのみで precision を計測する高速評価。
+
+    P1-1 FIX: 全50サンプル eval の分布バイアスを排除した precision 専用評価。
+    """
+    eval_location = "us-central1"
+    vertexai.init(project=project, location=eval_location)
+
+    clean_dataset = [s for s in EVAL_DATASET if not s.get("known_violations")]
+    print(f"\n[clean-eval] model={model_id}, clean_samples={len(clean_dataset)}")
+
+    results: dict[str, Any] = {
+        "eval_type": "clean_only_precision",
+        "model": model_id,
+        "evaluated_at": datetime.utcnow().isoformat() + "Z",
+        "clean_samples": len(clean_dataset),
+        "rubrics": {},
+    }
+
+    for metric in ALL_RUBRICS:
+        metric_name = metric.metric_name
+        try:
+            df = pd.DataFrame(clean_dataset)
+            task = EvalTask(dataset=df, metrics=[metric])
+            result = task.evaluate()
+            scores = _extract_scores(result, metric_name)
+            if scores:
+                fail_count = sum(1 for s in scores if s < 0)
+                pass_rate = round((len(scores) - fail_count) / len(scores), 3)
+                results["rubrics"][metric_name] = {
+                    "precision_pass_rate": pass_rate,
+                    "false_positive_count": fail_count,
+                    "note": "false positive = 違反なしサンプルを誤ってFAILした件数 (0が理想)",
+                }
+                print(f"  {metric_name}: precision={pass_rate}, FP={fail_count}")
+        except Exception as e:
+            results["rubrics"][metric_name] = {"error": str(e)}
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"[clean-eval] saved → {output_path}")
     return results
 
 
@@ -215,6 +312,10 @@ def main():
     parser.add_argument("--model", default=os.getenv("PLANNER_MODEL", "gemini-2.5-pro"))
     parser.add_argument("--output", default="results/eval_report.json")
     parser.add_argument("--ab", action="store_true", help="Run A/B comparison (planner vs fast)")
+    parser.add_argument(
+        "--clean-only", action="store_true",
+        help="P1-1: クリーンサンプルのみで precision を計測 (分布バイアスなし)"
+    )
     parser.add_argument("--project", default=os.getenv("GOOGLE_CLOUD_PROJECT", "runroute-476505"))
     parser.add_argument("--location", default=os.getenv("GOOGLE_CLOUD_REGION", "asia-northeast1"))
     parser.add_argument("--samples", type=int, default=50)
@@ -222,6 +323,9 @@ def main():
 
     if args.ab:
         run_ab_comparison("results", args.project, args.location)
+    elif args.clean_only:
+        # P1-1: precision 専用評価 (違反サンプルを除外して分布バイアスを排除)
+        run_clean_eval(args.model, "results/clean_precision_eval.json", args.project, args.location)
     else:
         run_eval(args.model, args.output, args.project, args.location, args.samples)
 
