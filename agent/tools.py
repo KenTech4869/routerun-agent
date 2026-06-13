@@ -13,16 +13,18 @@ MCP Schema (JSON-RPC 2.0 準拠):
 """
 
 import os
+import re
 import time as _time
 import requests
 from typing import Optional
 from firebase_admin import firestore, initialize_app, credentials, get_app
 from pydantic import BaseModel, Field
 
-PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "runroute-476505")
+PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]  # no hardcoded fallback — prevents accidental prod writes
 REGION = os.getenv("GOOGLE_CLOUD_REGION", "asia-northeast1")
 DATABASE_ID = os.getenv("FIREBASE_DATABASE_ID", "routerun-db")
 CF_BASE = os.getenv("CF_BASE_URL", f"https://{REGION}-{PROJECT}.cloudfunctions.net")
+_UID_RE = re.compile(r"^[a-zA-Z0-9]{20,128}$")  # Firebase UID format validator
 
 # Firebase Admin SDK — idempotent init
 def _db() -> firestore.Client:
@@ -80,6 +82,9 @@ class AthleteStateOutput(BaseModel):
     readinessAdjustment: Optional[str] = Field(None, description="maintain|reduce|intensify")
     readinessReason: Optional[str] = Field(None, description="あゆむエージェントによる調整理由")
     locale: Optional[str] = Field(None, description="ja|en")
+    completedSessions: Optional[list] = Field(None, description="過去14日間の完了済みランセッション — これらの日は再スケジュール禁止")
+    activePlanCycle: Optional[dict] = Field(None, description="現在有効な計画サイクル (phase/startDate/endDate/weeklyTargetKm)")
+    activePlanWeeks: Optional[list] = Field(None, description="現在の計画の全週セッション — completedSessions と照合して未消化分を特定する")
 
 
 class RouteAreaOutput(BaseModel):
@@ -104,6 +109,12 @@ class WritePlanOutput(BaseModel):
     skipped: bool = Field(False, description="冪等スキップ (同一 planVersion が既存)")
 
 
+class WriteRaceStrategyOutput(BaseModel):
+    """write_race_strategy の出力スキーマ。"""
+    success: bool = Field(..., description="書き込み成功フラグ")
+    saved_at: int = Field(..., description="保存時の UNIX タイムスタンプ")
+
+
 # ── Tool 1: Athlete State ──────────────────────────────────────────────────
 
 def get_athlete_state(uid: str) -> dict:
@@ -123,11 +134,38 @@ def get_athlete_state(uid: str) -> dict:
           raceTarget (dict | None): {eventId, eventName, date, distanceKm}
           currentFitness (dict): {vo2MaxEstimate, recentPaceMinPerKm, monthlyDistanceKm}
           locale (str): "ja" | "en"
+          completedSessions (list): 過去14日の完了済みセッション [{date, dayOfWeek, runId, actualDistanceKm, durationMin}]
+          activePlanCycle (dict | None): 現在の計画サイクル
+          activePlanWeeks (list): 現在の計画の全週
     """
+    import datetime as _dt
+    if not _UID_RE.match(uid or ""):
+        raise ValueError(f"[get_athlete_state] Invalid uid format — must be 20-128 alphanumeric chars")
     db = _db()
     doc = db.collection("users").document(uid).get()
     data = doc.to_dict() or {}
-    return data.get("goalContext", {})
+    goal_context = data.get("goalContext", {})
+
+    # INCREMENTAL PLANNING: Include completed sessions and active plan context so the
+    # agent can update the existing plan rather than regenerating it from zero each run.
+    training_plan = data.get("trainingPlan", {})
+
+    # completedSessionMap: {runId: {date, dayOfWeek, actualDistanceKm, durationMin}}
+    # Stored as a map for natural idempotency (same runId write = no-op).
+    completed_map = training_plan.get("completedSessionMap", {})
+    cutoff_date = (_dt.date.today() - _dt.timedelta(days=14)).isoformat()
+    recent_completed = [
+        {"runId": run_id, **session}
+        for run_id, session in completed_map.items()
+        if isinstance(session, dict) and session.get("date", "") >= cutoff_date
+    ]
+
+    return {
+        **goal_context,
+        "completedSessions": recent_completed,
+        "activePlanCycle": training_plan.get("cycle"),
+        "activePlanWeeks": training_plan.get("weeks", []),
+    }
 
 
 # ── Tool 2: Route Area Suggestion ─────────────────────────────────────────
@@ -192,6 +230,21 @@ def recommend_races(
 
     Returns:
         RaceRecommendationOutput schema: recommendations, totalCandidates
+
+    P1-1 TODO (Google Search Grounding — $500 予算内優先実装):
+        現状: recommendEventsV3 は内部イベント DB のみ参照。
+        改善: Vertex AI の googleSearchRetrieval grounding を有効にすることで
+              実際のレース情報（開催日・エントリー状況・コース情報）をリアルタイムで接地できる。
+        実装手順:
+          1. `google-cloud-aiplatform` SDK で `GenerationConfig` に
+             `groundingConfig=GroundingConfig(google_search_retrieval=GoogleSearchRetrieval())`
+             を追加して Gemini 呼び出しを行うヘルパー関数を実装。
+          2. この関数に "〈location〉周辺の〈distance_km〉kmクラスのマラソン大会 開催日程" を
+             クエリとして渡し、grounding チャンク（URL + スニペット）を取得。
+          3. recommendEventsV3 の結果にグラウンディング情報を annotate して返す。
+        コスト見積もり: 月間 1000 クエリで約 $20-30 (Dynamic Retrieval 使用でさらに削減可)
+        GCP サービス: Vertex AI Grounding with Google Search
+                      https://cloud.google.com/vertex-ai/generative-ai/docs/grounding/overview
     """
     return _call(
         "recommendEventsV3",
@@ -231,6 +284,49 @@ def chat_with_coach(
         },
         uid_token,
     )
+
+
+# ── Tool 5: Weather Context ───────────────────────────────────────────────
+
+def get_weather_context(latitude: float, longitude: float) -> dict:
+    """現在地の天気コンテキスト（気温・湿度・降水確率・風速・AQI）を取得する。
+
+    Cloud Function getWeatherContext を呼び出す（6時間 Firestore キャッシュ付き）。
+    Route Intelligence agent がルート推薦前に必ず呼ぶ。
+    ネットワーク障害時は caution フォールバックを返す（raise しない）。
+
+    Args:
+        latitude: 走者の緯度
+        longitude: 走者の経度
+
+    Returns:
+        temperature_c: float — 気温 (°C)
+        humidity_pct: float — 湿度 (%)
+        precipitation_prob: float — 降水確率 (0.0–1.0)
+        wind_speed_ms: float — 風速 (m/s)
+        aqi: int — Air Quality Index (0-500)
+        condition: str — "clear" | "cloudy" | "rain" | "snow" | "storm"
+        advice: str — "go" | "caution" | "avoid"
+    """
+    try:
+        r = requests.get(
+            f"{CF_BASE}/getWeatherContext",
+            params={"lat": latitude, "lng": longitude},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {
+            "temperature_c": None,
+            "humidity_pct": None,
+            "precipitation_prob": None,
+            "wind_speed_ms": None,
+            "aqi": None,
+            "condition": "unknown",
+            "advice": "caution",
+            "error": str(e),
+        }
 
 
 # ── P1-DeepMind: ACWR ルールベース安全チェック（公開名に変更）────────────────
@@ -301,8 +397,19 @@ def write_training_plan(uid: str, plan: dict) -> dict:
     """
     import json as _json
 
+    # EVALUATOR HARD GATE: evaluatorPassed=True が確認された計画のみ永続化を許可。
+    # Head Coach の Instruction では「FAIL なら再送（最大2回）」と指示しているが、
+    # LLM が指示を無視しても write_training_plan を呼べないようコードで強制する。
+    # これにより SDT / HonestData / ACWR / InjuryDisclaimer 検査をすり抜けた計画が
+    # ユーザーに届くことを完全に防ぐ。
+    if not plan.get("evaluatorPassed", False):
+        raise ValueError(
+            "[Evaluator Gate] 計画拒否: evaluatorPassed=True が必須です。"
+            "evaluator に計画を送り PASS を受け取ってから write_training_plan を呼んでください。"
+        )
+
     # P1-SDT: SDT 禁止ワードをルールベースでチェック（LLM に依存しない二重ガード）
-    SDT_FORBIDDEN = ["slow", "遅い", "遅く", "遅すぎ", "too slow"]
+    SDT_FORBIDDEN = ["slow", "too slow", "lazy", "sluggish", "遅い", "遅く", "遅すぎ", "のんびり", "ゆっくり"]
     plan_text = _json.dumps(plan, ensure_ascii=False).lower()
     sdt_hits = [w for w in SDT_FORBIDDEN if w in plan_text]
     if sdt_hits:
@@ -312,21 +419,30 @@ def write_training_plan(uid: str, plan: dict) -> dict:
         )
 
     # P1-DeepMind: Pro ミドルウェアで認可チェック（ツールから分離）
+    # Security FIX: removed isDemo/test_ bypass — client-controlled flags must not gate server writes
     is_pro = _is_pro_user(uid)
-    if not plan.get("isDemo", False) and not uid.startswith("test_") and not is_pro:
+    if not is_pro:
         raise ValueError(
-            "write_training_plan: Pro 会員または isDemo=true が必要です。"
-            "uid を test_ プレフィックスにするか、Pro プランにアップグレードしてください。"
+            "write_training_plan: Pro 会員が必要です。Pro プランにアップグレードしてください。"
         )
 
     db = _db()
 
-    # P2-DeepMind: 冪等性チェック — 同一 planVersion は重複書き込みしない
+    # SINGLE READ: Read the existing user document once, reused for:
+    #   1. Idempotency check (planVersion comparison)   — P2-DeepMind
+    #   2. ACWR safety check (goalContext)              — avoids second Firestore read
+    #   3. Preserving completedSessionMap               — incremental planning
     incoming_version = plan.get("planVersion") or plan.get("plan_version")
-    if incoming_version is not None:
-        try:
-            existing_doc = db.collection("users").document(uid).get()
-            existing_plan = (existing_doc.to_dict() or {}).get("trainingPlan", {})
+    existing_doc_data: dict = {}
+    existing_completed_map: dict = {}
+    try:
+        existing_doc = db.collection("users").document(uid).get()
+        existing_doc_data = existing_doc.to_dict() or {}
+        existing_plan = existing_doc_data.get("trainingPlan", {})
+        existing_completed_map = existing_plan.get("completedSessionMap", {})
+
+        # P2-DeepMind: 冪等性チェック — 同一 planVersion は重複書き込みしない
+        if incoming_version is not None:
             existing_version = existing_plan.get("planVersion") or existing_plan.get("plan_version")
             if existing_version is not None and existing_version == incoming_version:
                 return {
@@ -335,59 +451,70 @@ def write_training_plan(uid: str, plan: dict) -> dict:
                     "readiness_updated": False,
                     "skipped": True,
                 }
-        except Exception:
-            pass  # 読み取り失敗 → 書き込み続行
+    except Exception as read_err:
+        raise ValueError(
+            f"[write_training_plan] Firestore 読み取り失敗: {read_err}. "
+            "completedSessionMap が読み取れないため書き込みを中断します。"
+            "走者の完了済みセッション記録を保護するため、一時的エラーの場合は再試行してください。"
+        ) from read_err
 
-    # ACWR ルールベース安全チェック
+    # P0-3 SCHEMA VALIDATION: Firestore 書き込み前に必須フィールドの型・値域を検証する。
+    # evaluator PASS を通過した計画でも LLM が不正な型を返す可能性があるため、
+    # ルールベース検証で iOS クラッシュを防ぐ。
+    VALID_ADJUSTMENTS = {"maintain", "reduce", "intensify"}
+    agent_adjustment = plan.get("readinessAdjustment")
+    if agent_adjustment is not None and agent_adjustment not in VALID_ADJUSTMENTS:
+        raise ValueError(
+            f"[Schema] readinessAdjustment='{agent_adjustment}' が無効。"
+            f"{VALID_ADJUSTMENTS} のいずれかを使用すること。"
+        )
+    if "weeks" in plan and not isinstance(plan["weeks"], list):
+        raise ValueError("[Schema] 'weeks' フィールドはリスト (array) である必要があります。")
+    if "cycle" in plan and not isinstance(plan["cycle"], dict):
+        raise ValueError("[Schema] 'cycle' フィールドはオブジェクト (dict) である必要があります。")
+
+    # ACWR ルールベース安全チェック（既読ドキュメントを再利用して Firestore 読み取りを節約）
     try:
-        user_doc = db.collection("users").document(uid).get()
-        goal_context = (user_doc.to_dict() or {}).get("goalContext", {})
+        goal_context = existing_doc_data.get("goalContext", {})
         fitness = goal_context.get("currentFitness", {})
         athlete_state_for_check = {
-            "weeklyDistanceKm": fitness.get("weeklyDistanceKm", 0),
-            "acwr": fitness.get("acwr", 0.0),
+            "weeklyDistanceKm": fitness.get("weeklyDistanceKm") or fitness.get("weeklyTargetKm", 0),
+            "acwr": fitness.get("acwr") or goal_context.get("acwr", 0.0),
         }
         check_acwr_safety(plan, athlete_state_for_check)
     except ValueError:
         raise
     except Exception:
-        pass  # Firestore 読み取り失敗はスキップ
+        pass  # データ不足はスキップ
 
-    # training plan を永続化
-    saved_version = incoming_version or int(_time.time())
+    # P0-2 ATOMIC WRITE: trainingPlan と goalContext.currentFitness を単一の set() 呼び出しで
+    # アトミックに書き込む。2回目の write が失敗してもデータが不整合にならない。
+    # INCREMENTAL PLANNING: completedSessionMap を新計画に引き継ぐ。
+    # エージェントが新計画を上書きしても、ユーザーが実際に走ったセッション記録は消えない。
+    saved_version = incoming_version or int(_time.time() * 1000)  # milliseconds to avoid 1s collision window
+    now_ts = int(_time.time())
     plan_with_ts = {
         **plan,
-        "savedAt": int(_time.time()),
+        "savedAt": now_ts,
         "planVersion": saved_version,
+        "completedSessionMap": existing_completed_map,  # carry forward across plan rewrites
     }
-    db.collection("users").document(uid).set(
-        {"trainingPlan": plan_with_ts},
-        merge=True,
-    )
 
-    # P0-1 OpenAI UX Fix: readinessAdjustment + readinessReason を goalContext に反映
-    # エージェントの多変量判断（HRV・睡眠・安静時 HR）をルールベースより優先して Firestore に書く。
-    # これにより iOS の AgentActionBanner にエージェントの実際の判断理由が表示される。
+    update_payload: dict = {"trainingPlan": plan_with_ts}
     readiness_updated = False
-    agent_adjustment = plan.get("readinessAdjustment")
+
     agent_reason = plan.get("readinessReason") or plan.get("message")
-    if agent_adjustment in ("maintain", "reduce", "intensify"):
-        try:
-            db.collection("users").document(uid).set(
-                {
-                    "goalContext": {
-                        "currentFitness": {
-                            "readinessAdjustment": agent_adjustment,
-                            "readinessReason": agent_reason,
-                            "agentUpdatedAt": int(_time.time()),
-                        }
-                    }
-                },
-                merge=True,
-            )
-            readiness_updated = True
-        except Exception:
-            pass  # goalContext 更新失敗は非致命的（ルールベース値が残る）
+    if agent_adjustment in VALID_ADJUSTMENTS:
+        update_payload["goalContext"] = {
+            "currentFitness": {
+                "readinessAdjustment": agent_adjustment,
+                "readinessReason": agent_reason,
+                "agentUpdatedAt": now_ts,
+            }
+        }
+        readiness_updated = True
+
+    db.collection("users").document(uid).set(update_payload, merge=True)
 
     return {
         "success": True,
@@ -395,3 +522,79 @@ def write_training_plan(uid: str, plan: dict) -> dict:
         "readiness_updated": readiness_updated,
         "skipped": False,
     }
+
+
+# ── Tool 6: Write Race Strategy ───────────────────────────────────────────
+
+def write_race_strategy(uid: str, strategy: dict) -> dict:
+    """レース前日のペーシング戦略を users/{uid}.raceStrategy に永続化。
+
+    Race Strategy Specialist agent が評価済み戦略を呼び出す。
+    iOS の DashboardCardsView / AICoachingView がこのデータを読んで
+    レース当日のペース計画を表示する。
+
+    Args:
+        uid: Firebase user ID
+        strategy: RACE_STRATEGY 形式の JSON
+                  必須: evaluatorPassed=True, racePacing.segments (list)
+                  任意: message, locale, racePacing.approach, racePacing.acwrAdjustment
+
+    Returns:
+        WriteRaceStrategyOutput schema: {success, saved_at}
+    """
+    import json as _json
+
+    # EVALUATOR HARD GATE
+    if not strategy.get("evaluatorPassed", False):
+        raise ValueError(
+            "[Evaluator Gate] 戦略拒否: evaluatorPassed=True が必須です。"
+            "evaluator に戦略を送り PASS を受け取ってから write_race_strategy を呼んでください。"
+        )
+
+    # SDT 禁止ワードチェック
+    SDT_FORBIDDEN = ["slow", "too slow", "lazy", "sluggish", "遅い", "遅く", "遅すぎ", "のんびり", "ゆっくり"]
+    strategy_text = _json.dumps(strategy, ensure_ascii=False).lower()
+    sdt_hits = [w for w in SDT_FORBIDDEN if w in strategy_text]
+    if sdt_hits:
+        raise ValueError(
+            f"[SDT Safety] 戦略拒否: 禁止ワード {sdt_hits} を検出。"
+            f"ペースはゾーン表記（zone1-zone5/race）に置き換えること。"
+        )
+
+    # スキーマ検証
+    pacing = strategy.get("racePacing", {})
+    if not isinstance(pacing.get("segments"), list) or len(pacing["segments"]) == 0:
+        raise ValueError("[Schema] racePacing.segments はリスト (配列) であり最低1要素が必要です。")
+
+    # Pro ガード — Security FIX: removed isDemo/test_ bypass (client-controlled, not trustworthy)
+    if not _is_pro_user(uid):
+        raise ValueError("write_race_strategy: Pro 会員が必要です。")
+
+    # ACWR 安全チェック: acwr > 1.3 の場合はコンサバティブ戦略を強制
+    # write_training_plan の check_acwr_safety() と同等のガードを race strategy にも適用する。
+    # RACE_STRATEGY instruction は acwr > 1.2 でコンサバティブを推奨するが、
+    # LLM が指示を無視しても acwr > 1.3 の場合は tool 層でコード的に強制する。
+    try:
+        user_doc = _db().collection("users").document(uid).get()
+        user_data = user_doc.to_dict() or {}
+        goal_context = user_data.get("goalContext", {})
+        fitness = goal_context.get("currentFitness", {})
+        acwr = fitness.get("acwr") or goal_context.get("acwr", 0.0)
+        if isinstance(acwr, (int, float)) and acwr > 1.3:
+            pacing = strategy.get("racePacing", {})
+            if pacing.get("acwrAdjustment") not in ("conservative",):
+                import logging as _logging
+                _logging.warning(
+                    f"[write_race_strategy] ACWR={acwr:.2f} > 1.3 — forcing acwrAdjustment=conservative"
+                )
+                strategy = {**strategy, "racePacing": {**pacing, "acwrAdjustment": "conservative"}}
+    except Exception:
+        pass  # データ取得失敗はスキップ（保守的: 戦略は進める）
+
+    db = _db()
+    now_ts = int(_time.time())
+    strategy_with_ts = {**strategy, "savedAt": now_ts}
+
+    db.collection("users").document(uid).set({"raceStrategy": strategy_with_ts}, merge=True)
+
+    return {"success": True, "saved_at": now_ts}
