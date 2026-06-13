@@ -36,37 +36,22 @@ DATABASE_ID = os.getenv("FIREBASE_DATABASE_ID", "routerun-db")
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "runroute-476505")
 WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY", "")  # Firebase コンソール > プロジェクト設定 > ウェブ API キー
 
-# テストユーザー一覧 (§8 Q5 allowlist と一致)
+# デモユーザー (demo@routerun.jp のみ)
 DEMO_USERS = [
     {
-        "uid": "test_sub4",
-        "display_name": "Demo Runner — Sub-4 Goal",
-        "email": "test_sub4@demo.routerun.app",
+        "uid": "d2sEnjl1tlWN7BVJXAYkB7eBOys2",
+        "display_name": "Demo User",
+        "email": "demo@routerun.jp",
         "locale": "ja",
         "goal": "fullMarathon",
         "level": "intermediate",
         "target_pace_min_per_km": 5.67,   # 5:40/km × 42.195km = 3:59:50 → サブ4レースペース
-        "weekly_distance_km": 52.0,        # intermediate サブ4: 50〜65km/週が標準
+        "weekly_distance_km": 52.0,
         "vo2max": 48.0,
         "race_name": "東京マラソン 2027",
         "race_distance_km": 42.195,
         "race_date": "2027-03-07",
         "race_event_id": "tokyo-marathon-2027",
-    },
-    {
-        "uid": "test_firstfull",
-        "display_name": "Demo Runner — First Full Marathon",
-        "email": "test_firstfull@demo.routerun.app",
-        "locale": "ja",
-        "goal": "fullMarathon",
-        "level": "beginner",
-        "target_pace_min_per_km": 6.50,   # 完走目標 6:50 min/km
-        "weekly_distance_km": 25.0,
-        "vo2max": 42.0,
-        "race_name": "大阪マラソン 2027",
-        "race_distance_km": 42.195,
-        "race_date": "2027-01-31",
-        "race_event_id": "osaka-marathon-2027",
     },
 ]
 
@@ -102,7 +87,7 @@ def _make_run_doc(
     if skip:
         return None
 
-    base_date = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    base_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(weeks=8)
     run_date = base_date + timedelta(weeks=week - 1, days=day_offset)
     duration_sec = int(distance_km * pace_min_per_km * 60)
 

@@ -1,80 +1,23 @@
 # monitoring_alert.yaml
 #
-# GCP P0-2 Fix: PubSub DLQ (Dead Letter Queue) Cloud Monitoring アラート定義。
-# run-analysis-dlq サブスクリプションにメッセージが蓄積した場合に即座に通知する。
+# このファイルは目次です。実際のアラートポリシーは個別ファイルに分割されています。
+# (gcloud alpha monitoring policies create は単一ドキュメントのみ対応のため)
 #
 # デプロイ方法:
-#   gcloud alpha monitoring policies create --policy-from-file=deploy/monitoring_alert.yaml
+#   # 通知チャネル ID を確認
+#   gcloud alpha monitoring channels list --project=runroute-476505
 #
-# 前提条件:
-#   - PubSub DLQ サブスクリプション: run-analysis-dlq-sub が存在すること
-#   - 通知チャネル ID (notificationChannels) を実際のチャネル ID に置き換えること
-#     gcloud alpha monitoring channels list --project=runroute-476505
+#   # REPLACE_WITH_CHANNEL_ID を置換してデプロイ
+#   CHANNEL_ID="projects/runroute-476505/notificationChannels/YOUR_ID"
+#   for f in deploy/alert_0*.yaml; do
+#     sed -i '' "s|REPLACE_WITH_CHANNEL_ID|YOUR_ID|g" "$f"
+#     gcloud alpha monitoring policies create --policy-from-file="$f" --project=runroute-476505
+#   done
 #
-# 参考: onRunAnalysisTrigger に retry: true が設定されているため、
-# 処理失敗メッセージは自動リトライされる。DLQ にメッセージが蓄積する場合は
-# claimedAt ロックの期限切れ・タイムアウト・クラッシュが原因。
-
-displayName: "RouteRun PubSub DLQ Alert — run-analysis"
-documentation:
-  content: |
-    ## run-analysis DLQ にメッセージが蓄積しています
-
-    **原因の可能性:**
-    - onRunAnalysisTrigger のタイムアウト (540s 超過)
-    - 未処理の例外 (claimedAt トランザクション以外のパス)
-    - Firestore の一時的な書き込み失敗
-
-    **確認手順:**
-    1. Cloud Logging: `resource.type="cloud_function" AND resource.labels.function_name="onRunAnalysisTrigger"`
-    2. Firestore: `run_analysis_queue` コレクションで `status="processing"` かつ古い `claimedAt` を確認
-    3. PubSub コンソール: run-analysis-dlq-sub のメッセージを確認
-
-    **解消手順:**
-    - DLQ メッセージを手動で再パブリッシュ: `gcloud pubsub subscriptions pull run-analysis-dlq-sub --limit=10`
-    - スタックした processing ジョブをリセット: Firestore で `claimedAt` を削除して再トリガー
-  mimeType: text/markdown
-combiner: OR
-conditions:
-  - displayName: "DLQ message count > 0 (5分間)"
-    conditionThreshold:
-      filter: |
-        resource.type = "pubsub_subscription"
-        AND resource.label.subscription_id = "run-analysis-dlq-sub"
-        AND metric.type = "pubsub.googleapis.com/subscription/num_undelivered_messages"
-      comparison: COMPARISON_GT
-      thresholdValue: 0
-      duration: 300s
-      aggregations:
-        - alignmentPeriod: 60s
-          crossSeriesReducer: REDUCE_MAX
-          perSeriesAligner: ALIGN_MAX
-      trigger:
-        count: 1
-  - displayName: "onRunAnalysisTrigger エラー率 > 5% (10分間)"
-    conditionThreshold:
-      filter: |
-        resource.type = "cloud_function"
-        AND resource.label.function_name = "onRunAnalysisTrigger"
-        AND metric.type = "cloudfunctions.googleapis.com/function/execution_count"
-        AND metric.label.status = "error"
-      comparison: COMPARISON_GT
-      thresholdValue: 0.05
-      duration: 600s
-      aggregations:
-        - alignmentPeriod: 60s
-          crossSeriesReducer: REDUCE_MEAN
-          perSeriesAligner: ALIGN_RATE
-      trigger:
-        count: 1
-alertStrategy:
-  autoClose: 1800s  # 30分後に自動クローズ（DLQ が空になれば解消）
-notificationChannels:
-  # 実際のチャネル ID に置き換えること:
-  # gcloud alpha monitoring channels list --project=runroute-476505
-  - projects/runroute-476505/notificationChannels/REPLACE_WITH_CHANNEL_ID
-severity: CRITICAL
-userLabels:
-  service: "routerun-coaching"
-  component: "run-analysis-pipeline"
-  env: "production"
+#   または setup_infrastructure.sh を実行 (Pub/Sub DLQ + Firestore TTL も含む):
+#   ./deploy/setup_infrastructure.sh
+#
+# アラートポリシー一覧:
+#   alert_01_run_analysis.yaml   — run-analysis DLQ (CRITICAL)
+#   alert_02_proactive_coach.yaml — proactive-coach DLQ (CRITICAL)
+#   alert_03_gemini_429.yaml     — Gemini 429 カスケード (WARNING)

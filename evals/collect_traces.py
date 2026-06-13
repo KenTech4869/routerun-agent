@@ -36,7 +36,14 @@ except ImportError:
 
 PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "runroute-476505")
 DATABASE_ID = os.getenv("FIREBASE_DATABASE_ID", "routerun-db")
-PSEUDONYMIZATION_KEY = os.getenv("PSEUDONYMIZATION_SECRET", "dev-key-replace-in-prod")
+_raw_pseudonymization_key = os.getenv("PSEUDONYMIZATION_SECRET")
+if not _raw_pseudonymization_key:
+    raise RuntimeError(
+        "PSEUDONYMIZATION_SECRET env var is required. "
+        "Set it to a stable secret key — never rotate it, as GDPR Art.17 erasure "
+        "relies on this key being constant to re-pseudonymize records before deletion."
+    )
+PSEUDONYMIZATION_KEY = _raw_pseudonymization_key
 
 # 高品質サンプルの最低評価スコア（1-5）
 MIN_RATING = 4

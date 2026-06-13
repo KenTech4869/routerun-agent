@@ -51,6 +51,10 @@ def _init_firebase():
 
 def _invoke_local(uid: str, week: int) -> dict[str, Any]:
     """ローカル ADK agent を直接呼び出す（Agent Engine 不要）。"""
+    import asyncio
+    from google.adk import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types as genai_types
     from agent.agents import head_coach
 
     prompt = (
@@ -60,8 +64,32 @@ def _invoke_local(uid: str, week: int) -> dict[str, Any]:
         f"Week {week+1} に向けたトレーニング計画を立てよ。"
         f"必ず evaluator に通してから最終出力すること。"
     )
-    result = head_coach.invoke(prompt)
-    return {"raw": str(result), "week": week, "uid": uid}
+
+    async def _run():
+        session_service = InMemorySessionService()
+        session = await session_service.create_session(
+            app_name="routerun_demo", user_id=uid
+        )
+        runner = Runner(
+            agent=head_coach,
+            app_name="routerun_demo",
+            session_service=session_service,
+        )
+        events = []
+        async for event in runner.run_async(
+            user_id=uid,
+            session_id=session.id,
+            new_message=genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=prompt)],
+            ),
+        ):
+            events.append(event)
+        raw = "\n".join(str(e) for e in events)
+        return raw
+
+    raw = asyncio.run(_run())
+    return {"raw": raw, "week": week, "uid": uid}
 
 
 def _invoke_remote(uid: str, week: int) -> dict[str, Any]:
@@ -231,7 +259,7 @@ def run_timeline(uid: str, use_local: bool = False) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="RouteRun compressed timeline demo")
-    parser.add_argument("--uid", default="test_sub4", choices=["test_sub4", "test_firstfull"])
+    parser.add_argument("--uid", default="d2sEnjl1tlWN7BVJXAYkB7eBOys2")
     parser.add_argument("--local", action="store_true", help="Use local ADK (no Agent Engine)")
     args = parser.parse_args()
 

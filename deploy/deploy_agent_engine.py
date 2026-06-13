@@ -22,177 +22,20 @@ from typing import Optional
 import vertexai
 from vertexai import agent_engines
 
+# ── System instructions (strings pickle by value — module-level OK) ────────
+# Single source of truth: import from agent.instructions to eliminate drift.
+from agent.instructions import (  # noqa: E402
+    HEAD_COACH_INSTRUCTION,
+    PERIODIZATION,
+    READINESS,
+    EVALUATOR,
+    RACE_STRATEGY,
+    ROUTE_INTELLIGENCE,
+)
+
 PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "runroute-476505")
 REGION = os.getenv("GOOGLE_CLOUD_REGION", "asia-northeast1")
 STAGING_BUCKET = os.getenv("STAGING_BUCKET", f"gs://{PROJECT}-agent-staging")
-
-# ── System instructions (strings pickle by value — module-level OK) ────────
-
-HEAD_COACH_INSTRUCTION = """
-# 役割
-あなたは「あゆむ」。RouteRun の自律ランニングコーチであり、走者のレース準備アーク全体
-(Discovery → Entry → Training → Race Day → Post-Race → Next Goal) を能動的に管理する
-Plan Manager です。リアクティブなチャットボットではなく、計画を所有し更新し続けます。
-
-# 動作ループ（各サイクルで必ずこの順）
-1. get_athlete_state で現在の fitness state (acwr / trainingPhase / weeklyVolumeTrend /
-   todayWorkout / raceTarget) を読む。
-2. periodization に委譲し、目標レースに向けた次の練習ブロックを設計させる。
-3. readiness に委譲し、当日の体調シグナルで負荷を「維持/軽減/強化」調整させる。
-4. 必要なら suggest_route_areas で各セッションのコースを用意し、目標が未/再設定の走者には
-   recommend_races でレースを提案する。
-5. 組み上げた計画とメッセージを evaluator に送る。
-6. evaluator が PASS した内容のみを最終出力とする。違反が返れば修正して再送する（最大2回）。
-7. evaluator が PASS した計画を write_training_plan(uid=<走者のuid>, plan=<JSON計画>) で
-   Firestore Memory Bank に永続化する。uid は get_athlete_state の引数と同じ値を使う。
-
-# 出力フォーマット（JSON）
-最終出力は以下の JSON 構造に準拠する:
-{
-  "message": "<走者向けメッセージ（locale に合わせた言語）>",
-  "locale": "ja|en",
-  "readinessAdjustment": "maintain|reduce|intensify",
-  "acwr": <float>,
-  "cycle": {
-    "phase": "base_building|build|peak|taper|recovery",
-    "startDate": "YYYY-MM-DD",
-    "endDate": "YYYY-MM-DD",
-    "weeklyTargetKm": <float>
-  },
-  "weeks": [
-    {
-      "weekNumber": <int>,
-      "sessions": [
-        {
-          "day": "monday|tuesday|wednesday|thursday|friday|saturday|sunday",
-          "type": "easy|tempo|interval|long|recovery|rest",
-          "distanceKm": <float>,
-          "paceZone": "zone1|zone2|zone3|zone4|zone5|race",
-          "notes": "<1文のコーチメモ（日本語 or 英語）>"
-        }
-      ]
-    }
-  ],
-  "evaluatorPassed": true
-}
-
-# 絶対制約（違反不可）
-- 「slow / 遅い」を使わない。すべてのペースを等しく価値あるものとして扱う。
-- Honest Data Only: 入力データ (センサー/スプリット/rule-engine 出力) に無い統計値・推定値を
-  一切創作しない。環境ペース補正などの「発明データ」を出さない。
-- 安全性: 週次負荷の増加は ACWR 上限 (+10%) を超えない。
-- 走者が使用している言語 (locale) で応答する (日本語/英語)。
-
-# トーン
-スポーツ科学の深さを持つ共感的な伴走者。冷たい分析システムではない。
-過剰な装飾を避け簡潔で前向き。人格は名前と文体で表現し大げさな自己演出はしない
-(Restraint over Spectacle)。
-"""
-
-PERIODIZATION = """
-# 役割: Periodization Specialist
-目標レースに向けたメソ/マイクロサイクルを構築・調整する専門 agent。
-
-# 入力
-get_athlete_state から受け取った fitness state (acwr / trainingPhase / weeklyVolumeTrend /
-raceTarget) を必ず最初に読み込む。
-
-# 出力ルール
-- 週次負荷の増加は ACWR 上限 (+10%) を超えない。
-- 各セッション: type (easy|tempo|interval|long|recovery|rest) / distanceKm / paceZone を明示。
-- データが無い項目は推測しない。
--「slow / 遅い」を使わない。ペースはゾーン (zone1〜zone5 / race) で表現する。
-- 出力は Head Coach が JSON に組み込める構造化テキスト。
-"""
-
-READINESS = """
-# 役割: Readiness Specialist
-当日の HRV / 睡眠 / 安静時 HR から本日のセッション調整を決める専門 agent。
-
-# 判定基準
-- 全指標良好 → "intensify"（負荷 +5〜10%）
-- 通常範囲内 → "maintain"
-- HRV 低下 or 睡眠 <6h or HR +10bpm 以上 → "reduce"（負荷 -10〜20%）
-
-# ルール
-- データが無い項目は推測しない。データ不足なら "maintain" を返す。
-- 理由を1文で添える。
-- 出力形式: {"adjustment": "maintain|reduce|intensify", "reason": "<1文>"}
-"""
-
-EVALUATOR = """
-# 役割: Quality Gate Evaluator
-Head Coach が生成した計画/メッセージを提出前に検査する批評 agent。
-パターンマッチと数値比較に特化した高速ゲート。
-
-# 検査手順（必ずこの順で実行）
-
-## Step 1: SDT 言語チェック
-入力テキスト中に以下の文字列が 1 つでも存在するか検索する:
-  - 「slow」「遅い」「遅く」「遅すぎ」「too slow」
-存在する → SDT_FAIL として記録。
-
-## Step 2: Honest-Data チェック
-入力 athlete_state に存在しない数値（VO2max 推定・環境補正ペース・「平均的なランナー」統計等）が
-レスポンス中に出現しているか確認する。
-athlete_state に明示された値のみが許容される。
-創作数値が存在する → HONEST_FAIL として記録。
-
-## Step 3: ACWR 安全チェック
-athlete_state の acwr と weeklyDistanceKm を読み取る。
-レスポンス中の weeklyTargetKm（または同義の週間目標距離）を特定する。
-計算: increase_rate = (weeklyTargetKm - weeklyDistanceKm) / weeklyDistanceKm
-以下のいずれかに該当する → ACWR_FAIL として記録:
-  - increase_rate > 0.10 (現在距離比 +10% 超過)
-  - acwr > 1.3 かつ weeklyTargetKm > weeklyDistanceKm (高 ACWR 時の負荷増加)
-
-## Step 4: 判定
-- 記録した FAIL が 0 件 → {"result": "PASS"}
-- 記録した FAIL が 1 件以上 → {"result": "FAIL", "violations": ["<Step番号>: <具体的な違反内容>", ...]}
-
-# 絶対ルール
-- PASS/FAIL 以外の判定は返さない。
-- violations の各エントリは Head Coach が即座に修正できるよう「どの単語/数値が問題か」を明示する。
-- athlete_state や weeklyDistanceKm が未提供の場合、Step 3 はスキップして PASS 扱いにする。
-
-# Few-Shot Examples（JA / EN 両方を参照すること）
-
-## [JA] Example 1 — PASS（違反なし）
-Input athlete_state: {"acwr": 0.95, "weeklyDistanceKm": 30}
-Input response: "今週は32kmを目標に、ゾーン2のイージーラン4回で構成します。"
-Step 1: 禁止ワードなし / Step 2: 外部統計なし / Step 3: +6.7% ≤ 10%, acwr=0.95 ≤ 1.3
-Output: {"result": "PASS"}
-
-## [JA] Example 2 — FAIL（SDT 違反）
-Input athlete_state: {"acwr": 1.0, "weeklyDistanceKm": 25}
-Input response: "ペースが遅すぎます。インターバルで改善しましょう。"
-Step 1: "遅すぎ" 検出 → SDT_FAIL
-Output: {"result": "FAIL", "violations": ["Step 1: '遅すぎ' を検出。ペースはゾーン表記に置き換えること"]}
-
-## [JA] Example 3 — FAIL（ACWR 超過）
-Input athlete_state: {"acwr": 1.35, "weeklyDistanceKm": 40}
-Input response: '{"weeklyTargetKm": 48}'
-Step 3: increase_rate=0.20 > 0.10, acwr=1.35 > 1.3 → ACWR_FAIL
-Output: {"result": "FAIL", "violations": ["Step 3: weeklyTargetKm=48km は+20%増 (上限+10%超過)。ACWR=1.35>1.3 時は負荷増加禁止"]}
-
-## [EN] Example 4 — PASS (no violations)
-Input athlete_state: {"acwr": 1.05, "weeklyDistanceKm": 40}
-Input response: "This week targets 42 km. Wednesday: tempo (zone 3). Sunday: long run (zone 2)."
-Step 1: No negative pace words / Step 2: No fabricated stats / Step 3: +5% ≤ 10%, acwr=1.05 ≤ 1.3
-Output: {"result": "PASS"}
-
-## [EN] Example 5 — FAIL (Honest-Data violation)
-Input athlete_state: {"acwr": 0.95, "weeklyDistanceKm": 28}
-Input response: "Your estimated VO2max is 52.3 ml/kg/min."
-Step 2: VO2max=52.3 absent from athlete_state → HONEST_FAIL
-Output: {"result": "FAIL", "violations": ["Step 2: VO2max=52.3 not in athlete_state. Remove fabricated values."]}
-
-## [EN] Example 6 — FAIL (SDT + ACWR double violation)
-Input athlete_state: {"acwr": 1.4, "weeklyDistanceKm": 35}
-Input response: '{"weeklyTargetKm": 42, "notes": "Your pace is too slow."}'
-Step 1: "too slow" → SDT_FAIL / Step 3: +20%, acwr=1.4 > 1.3 → ACWR_FAIL
-Output: {"result": "FAIL", "violations": ["Step 1: 'too slow' detected. Use zone notation.", "Step 3: +20% exceeds +10% limit. ACWR=1.4>1.3 prohibits load increase."]}
-"""
 
 
 def deploy() -> str:
@@ -258,12 +101,33 @@ def deploy() -> str:
         Returns:
             goalContext dict with keys:
               acwr, trainingPhase, weeklyVolumeTrend, todayWorkout, raceTarget,
-              currentFitness, locale
+              currentFitness, locale,
+              completedSessions (過去14日の完了済みセッション),
+              activePlanCycle (現在の計画サイクル),
+              activePlanWeeks (現在の計画の全週)
         """
+        import datetime as _dt
         db = _db()
         doc = db.collection("users").document(uid).get()
         data = doc.to_dict() or {}
-        return data.get("goalContext", {})
+        goal_context = data.get("goalContext", {})
+
+        # INCREMENTAL PLANNING: 完了済みセッションと現在の計画を含める
+        training_plan = data.get("trainingPlan", {})
+        completed_map = training_plan.get("completedSessionMap", {})
+        cutoff_date = (_dt.date.today() - _dt.timedelta(days=14)).isoformat()
+        recent_completed = [
+            {"runId": run_id, **session}
+            for run_id, session in completed_map.items()
+            if isinstance(session, dict) and session.get("date", "") >= cutoff_date
+        ]
+
+        return {
+            **goal_context,
+            "completedSessions": recent_completed,
+            "activePlanCycle": training_plan.get("cycle"),
+            "activePlanWeeks": training_plan.get("weeks", []),
+        }
 
     def suggest_route_areas(
         uid_token: str,
@@ -335,6 +199,41 @@ def deploy() -> str:
             uid_token,
         )
 
+    def get_weather_context(latitude: float, longitude: float) -> dict:
+        """現在地の天気コンテキスト（気温・湿度・降水確率・風速・AQI）を取得する。
+
+        Cloud Function getWeatherContext を呼び出す（6時間 Firestore キャッシュ付き）。
+        ネットワーク障害時は caution フォールバックを返す（raise しない）。
+
+        Args:
+            latitude: 走者の緯度
+            longitude: 走者の経度
+
+        Returns:
+            temperature_c, humidity_pct, precipitation_prob, wind_speed_ms,
+            aqi, condition, advice ("go"|"caution"|"avoid")
+        """
+        import requests as _requests
+        try:
+            r = _requests.get(
+                f"{_cf_base}/getWeatherContext",
+                params={"lat": latitude, "lng": longitude},
+                timeout=5,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {
+                "temperature_c": None,
+                "humidity_pct": None,
+                "precipitation_prob": None,
+                "wind_speed_ms": None,
+                "aqi": None,
+                "condition": "unknown",
+                "advice": "caution",
+                "error": str(e),
+            }
+
     def write_training_plan(uid: str, plan: dict) -> dict:
         """評価済み計画を users/{uid}.trainingPlan に永続化 (Memory Bank)。
 
@@ -366,24 +265,24 @@ def deploy() -> str:
 
         db = _db()
 
-        # P2-DeepMind: 冪等性チェック
+        # SINGLE READ: idempotency check + ACWR safety + completedSessionMap carry-forward.
+        # Raising on Firestore read failure prevents overwriting completed session history with {}.
         incoming_version = plan.get("planVersion") or plan.get("plan_version")
-        if incoming_version is not None:
-            try:
-                existing = (db.collection("users").document(uid).get().to_dict() or {})
-                existing_version = existing.get("trainingPlan", {}).get("planVersion")
+        existing_completed_map: dict = {}
+        try:
+            existing_doc_data = (db.collection("users").document(uid).get().to_dict() or {})
+            existing_plan = existing_doc_data.get("trainingPlan", {})
+            existing_completed_map = existing_plan.get("completedSessionMap", {})
+            # P2-DeepMind: 冪等性チェック — 同一 planVersion は重複書き込みしない
+            if incoming_version is not None:
+                existing_version = existing_plan.get("planVersion") or existing_plan.get("plan_version")
                 if existing_version is not None and existing_version == incoming_version:
                     return {"success": True, "plan_version": incoming_version, "readiness_updated": False, "skipped": True}
-            except Exception:
-                pass
-
-        # ACWR ルールベース安全チェック
-        try:
-            user_doc = db.collection("users").document(uid).get()
-            goal_context = (user_doc.to_dict() or {}).get("goalContext", {})
+            # ACWR ルールベース安全チェック
+            goal_context = existing_doc_data.get("goalContext", {})
             fitness = goal_context.get("currentFitness", {})
             current_km = fitness.get("weeklyDistanceKm", 0) or 0
-            acwr = fitness.get("acwr", 0.0) or 0.0
+            acwr_val = fitness.get("acwr", 0.0) or 0.0
             target_km = None
             if isinstance(plan.get("cycle"), dict):
                 target_km = plan["cycle"].get("weeklyTargetKm")
@@ -394,18 +293,22 @@ def deploy() -> str:
                 violations = []
                 if increase_rate > 0.10:
                     violations.append(f"週間目標 +{increase_rate * 100:.1f}% 超過 ({current_km}→{target_km}km, 上限+10%)")
-                if acwr > 1.3 and target_km > current_km:
-                    violations.append(f"ACWR={acwr:.2f}>1.3 時の負荷増加禁止 ({current_km}→{target_km}km)")
+                if acwr_val > 1.3 and target_km > current_km:
+                    violations.append(f"ACWR={acwr_val:.2f}>1.3 時の負荷増加禁止 ({current_km}→{target_km}km)")
                 if violations:
                     raise ValueError(f"[ACWR Safety] 計画拒否: {' / '.join(violations)}")
         except ValueError:
             raise
-        except Exception:
-            pass
+        except Exception as read_err:
+            raise ValueError(
+                f"[write_training_plan] Firestore 読み取り失敗: {read_err}. "
+                "completedSessionMap が読み取れないため書き込みを中断します。"
+                "走者の完了済みセッション記録を保護するため、一時的エラーの場合は再試行してください。"
+            ) from read_err
 
         saved_version = incoming_version or int(_t.time())
         db.collection("users").document(uid).set(
-            {"trainingPlan": {**plan, "savedAt": int(_t.time()), "planVersion": saved_version}},
+            {"trainingPlan": {**plan, "savedAt": int(_t.time()), "planVersion": saved_version, "completedSessionMap": existing_completed_map}},
             merge=True,
         )
 
@@ -428,6 +331,49 @@ def deploy() -> str:
                 pass
 
         return {"success": True, "plan_version": saved_version, "readiness_updated": readiness_updated, "skipped": False}
+
+    def write_race_strategy(uid: str, strategy: dict) -> dict:
+        """レース前日のペーシング戦略を users/{uid}.raceStrategy に永続化。
+
+        Race Strategy Specialist agent が評価済み戦略を呼び出す。
+
+        Args:
+            uid: Firebase user ID
+            strategy: RACE_STRATEGY 形式の JSON
+                      必須: evaluatorPassed=True, racePacing.segments (list)
+        """
+        import json as _json
+
+        if not strategy.get("evaluatorPassed", False):
+            raise ValueError(
+                "[Evaluator Gate] 戦略拒否: evaluatorPassed=True が必須です。"
+                "evaluator に戦略を送り PASS を受け取ってから write_race_strategy を呼んでください。"
+            )
+
+        SDT_FORBIDDEN = ["slow", "遅い", "遅く", "遅すぎ", "too slow"]
+        strategy_text = _json.dumps(strategy, ensure_ascii=False).lower()
+        sdt_hits = [w for w in SDT_FORBIDDEN if w in strategy_text]
+        if sdt_hits:
+            raise ValueError(
+                f"[SDT Safety] 戦略拒否: 禁止ワード {sdt_hits} を検出。"
+                "ペースはゾーン表記（zone1-zone5/race）に置き換えること。"
+            )
+
+        pacing = strategy.get("racePacing", {})
+        if not isinstance(pacing.get("segments"), list) or len(pacing["segments"]) == 0:
+            raise ValueError("[Schema] racePacing.segments はリスト (配列) であり最低1要素が必要です。")
+
+        if not strategy.get("isDemo", False) and not uid.startswith("test_") and not _is_pro_user(uid):
+            raise ValueError("write_race_strategy: Pro 会員が必要です。")
+
+        import time as _t
+        db = _db()
+        now_ts = int(_t.time())
+        db.collection("users").document(uid).set(
+            {"raceStrategy": {**strategy, "savedAt": now_ts}},
+            merge=True,
+        )
+        return {"success": True, "saved_at": now_ts}
 
     # ── Agent definitions ────────────────────────────────────────────────────
     from google.adk.agents import Agent
@@ -470,6 +416,20 @@ def deploy() -> str:
         model=LITE,
         instruction=EVALUATOR,
     )
+    race_strategy = Agent(
+        name="race_strategy",
+        model=FAST,
+        instruction=RACE_STRATEGY,
+        tools=[get_athlete_state, AgentTool(agent=evaluator), write_race_strategy],
+        generate_content_config=_thinking_medium,
+    )
+    route_intelligence = Agent(
+        name="route_intelligence",
+        model=FAST,
+        instruction=ROUTE_INTELLIGENCE,
+        tools=[get_athlete_state, get_weather_context],
+        generate_content_config=_thinking_medium,
+    )
     head_coach = Agent(
         name="ayumu_head_coach",
         model=PLANNER,
@@ -479,6 +439,8 @@ def deploy() -> str:
             AgentTool(agent=periodization),
             AgentTool(agent=readiness),
             AgentTool(agent=evaluator),
+            AgentTool(agent=race_strategy),
+            AgentTool(agent=route_intelligence),
             get_athlete_state,
             suggest_route_areas,
             recommend_races,
@@ -507,6 +469,8 @@ def deploy() -> str:
             "Supervisor multi-agent: Head Coach (gemini-2.5-pro, thinking=2048) + "
             "Periodization (gemini-2.5-pro, thinking=4096) + "
             "Readiness (gemini-2.5-flash, thinking=1024) + "
+            "Race Strategy (gemini-2.5-flash, thinking=1024) + "
+            "Route Intelligence (gemini-2.5-flash, thinking=1024) + "
             "Evaluator (gemini-2.5-flash-lite)."
         ),
     )

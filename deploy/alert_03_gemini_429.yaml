@@ -1,0 +1,57 @@
+# alert_03_gemini_429.yaml
+#
+# Cloud Monitoring: Gemini 429 カスケードアラート
+#
+# デプロイ:
+#   gcloud alpha monitoring policies create \
+#     --policy-from-file=deploy/alert_03_gemini_429.yaml \
+#     --project=runroute-476505
+#
+# 前提: Cloud Logging に gemini_429_error カスタムメトリクスが存在すること
+#       logStructured("gemini_429_error", ...) が Cloud Functions から出力されていること
+# 通知チャネル取得: gcloud alpha monitoring channels list --project=runroute-476505
+
+displayName: "RouteRun Gemini 429 Rate Limit Cascade"
+documentation:
+  content: |
+    ## Gemini API 429 エラーが多発しています
+
+    **原因の可能性:**
+    - 朝のスケジュール関数 (Morning Brief + Proactive Coaching) の同時実行
+    - Pro ユーザーの Deep Think バースト（4096 thinking tokens × 同時多発）
+    - Agent Engine の週次計画一括処理
+
+    **確認手順:**
+    1. Cloud Logging でエラー関数を特定: `jsonPayload.message=~"429"`
+    2. Gemini コンソール: Quota & Limits → 429 レートを確認
+    3. Circuit Breaker 状態: Firestore `ml_control/circuit_breaker` の `openUntil` を確認
+
+    **解消手順:**
+    - 一時的なら 60 秒待機（Circuit Breaker 自動リセット）
+    - 継続する場合: `GEMINI_GLOBAL_DAILY_LIMIT` を一時削減してスケジュール関数の実行を抑制
+  mimeType: text/markdown
+combiner: OR
+conditions:
+  - displayName: "Gemini 429 errors > 10 in 5 minutes"
+    conditionThreshold:
+      filter: |
+        resource.type = "cloud_function"
+        AND metric.type = "logging.googleapis.com/user/gemini_429_error"
+      comparison: COMPARISON_GT
+      thresholdValue: 10
+      duration: 300s
+      aggregations:
+        - alignmentPeriod: 60s
+          crossSeriesReducer: REDUCE_SUM
+          perSeriesAligner: ALIGN_RATE
+      trigger:
+        count: 1
+alertStrategy:
+  autoClose: 3600s
+notificationChannels:
+  - projects/runroute-476505/notificationChannels/REPLACE_WITH_CHANNEL_ID
+severity: WARNING
+userLabels:
+  service: "routerun-coaching"
+  component: "gemini-quota"
+  env: "production"

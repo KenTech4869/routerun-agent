@@ -1,0 +1,74 @@
+# alert_02_proactive_coach.yaml
+#
+# Cloud Monitoring: proactive-coach-trigger DLQ アラート
+#
+# デプロイ:
+#   gcloud alpha monitoring policies create \
+#     --policy-from-file=deploy/alert_02_proactive_coach.yaml \
+#     --project=runroute-476505
+#
+# 前提: proactive-coach-trigger-dlq-sub サブスクリプションが存在すること
+#       setup_infrastructure.sh を先に実行してください
+# 通知チャネル取得: gcloud alpha monitoring channels list --project=runroute-476505
+
+displayName: "RouteRun PubSub DLQ Alert — proactive-coach"
+documentation:
+  content: |
+    ## proactive-coach-trigger DLQ にメッセージが蓄積しています
+
+    **原因の可能性:**
+    - FCM 無効トークンによるクラッシュ（無効トークンは silent skip に修正済み — PE-0A）
+    - Gemini 429 レート制限（sendMorningBrief / Proactive Coaching の同時実行）
+    - Cloud Function タイムアウト (300s 超過)
+
+    **確認手順:**
+    1. Cloud Logging: `resource.type="cloud_function" AND resource.labels.function_name="onProactiveCoachWorker"`
+    2. Firestore: `proactive_coaching_log` コレクションで `status="failed"` を確認
+    3. PubSub コンソール: proactive-coach-trigger-dlq-sub のメッセージを確認
+
+    **解消手順:**
+    - DLQ メッセージを手動で再パブリッシュ
+    - Gemini 429 が原因の場合: 翌日まで待機（クォータ自動リセット）
+  mimeType: text/markdown
+combiner: OR
+conditions:
+  - displayName: "proactive-coach DLQ message count > 0 (5分間)"
+    conditionThreshold:
+      filter: |
+        resource.type = "pubsub_subscription"
+        AND resource.label.subscription_id = "proactive-coach-trigger-dlq-sub"
+        AND metric.type = "pubsub.googleapis.com/subscription/num_undelivered_messages"
+      comparison: COMPARISON_GT
+      thresholdValue: 0
+      duration: 300s
+      aggregations:
+        - alignmentPeriod: 60s
+          crossSeriesReducer: REDUCE_MAX
+          perSeriesAligner: ALIGN_MAX
+      trigger:
+        count: 1
+  - displayName: "onProactiveCoachWorker エラー率 > 5% (10分間)"
+    conditionThreshold:
+      filter: |
+        resource.type = "cloud_function"
+        AND resource.label.function_name = "onProactiveCoachWorker"
+        AND metric.type = "cloudfunctions.googleapis.com/function/execution_count"
+        AND metric.label.status = "error"
+      comparison: COMPARISON_GT
+      thresholdValue: 0.05
+      duration: 600s
+      aggregations:
+        - alignmentPeriod: 60s
+          crossSeriesReducer: REDUCE_MEAN
+          perSeriesAligner: ALIGN_RATE
+      trigger:
+        count: 1
+alertStrategy:
+  autoClose: 1800s
+notificationChannels:
+  - projects/runroute-476505/notificationChannels/REPLACE_WITH_CHANNEL_ID
+severity: CRITICAL
+userLabels:
+  service: "routerun-coaching"
+  component: "proactive-coach-pipeline"
+  env: "production"
